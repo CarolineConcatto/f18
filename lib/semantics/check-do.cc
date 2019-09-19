@@ -20,7 +20,7 @@
 #include "tools.h"
 #include "type.h"
 #include "../evaluate/expression.h"
-#include "../evaluate/traversal.h"
+#include "../evaluate/tools.h"
 #include "../parser/message.h"
 #include "../parser/parse-tree-visitor.h"
 
@@ -479,19 +479,15 @@ private:
   }
 
   static SymbolSet GatherSymbolsFromExpression(const parser::Expr &expression) {
+    SymbolSet result;
     if (const auto *expr{GetExpr(expression)}) {
-      struct CollectSymbols : public virtual evaluate::VisitorBase<SymbolSet> {
-        explicit CollectSymbols(int) {}
-        void Handle(const Symbol *symbol) {
-          if (const Symbol * root{GetAssociationRoot(*symbol)}) {
-            result().insert(root);
-          }
+      for (const Symbol *symbol : evaluate::CollectSymbols(*expr)) {
+        if (const Symbol * root{GetAssociationRoot(*symbol)}) {
+          result.insert(root);
         }
-      };
-      return evaluate::Visitor<CollectSymbols>{0}.Traverse(*expr);
-    } else {
-      return {};
+      }
     }
+    return result;
   }
 
   // C1121 - procedures in mask must be pure
