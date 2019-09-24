@@ -153,6 +153,10 @@ public:
     encoding_ = e;
     return *this;
   }
+  AllSources &set_isModuleFile(bool b) {
+    isModuleFile_ = b;
+    return *this;
+  }
 
   void PushSearchPathDirectory(std::string);
   std::string PopSearchPathDirectory();
@@ -218,6 +222,7 @@ private:
   std::vector<std::unique_ptr<SourceFile>> ownedSourceFiles_;
   std::vector<std::string> searchPath_;
   Encoding encoding_{Encoding::UTF_8};
+  bool isModuleFile_{false};
 };
 
 class CookedSource {

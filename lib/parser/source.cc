@@ -21,6 +21,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -124,7 +125,13 @@ bool SourceFile::Open(std::string path, std::stringstream *error) {
   errno = 0;
   fileDescriptor_ = open(path.c_str(), O_RDONLY);
   if (fileDescriptor_ < 0) {
-    *error << "could not open " << errorPath << ": " << std::strerror(errno);
+    *error << "Could not open " << errorPath << ": " << std::strerror(errno);
+    return false;
+  }
+  if (isModuleFile_ && flock(fileDescriptor_, LOCK_SH | LOCK_NB) != 0) {
+    close(fileDescriptor_);
+    *error << "Could not open " << errorPath << ": "
+           << "Another compilation is currently writing to it";
     return false;
   }
   ++openFileDescriptors;

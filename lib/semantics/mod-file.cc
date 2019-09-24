@@ -13,32 +13,45 @@
 // limitations under the License.
 
 #include "mod-file.h"
+#include "resolve-names.h"
 #include "scope.h"
 #include "semantics.h"
 #include "symbol.h"
 #include "../evaluate/traversal.h"
+#include "../parser/message.h"
 #include "../parser/parsing.h"
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <fstream>
 #include <ostream>
+#include <set>
+#include <string_view>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <vector>
 
 namespace Fortran::semantics {
 
 using namespace parser::literals;
 
-// The initial characters of a file that identify it as a .mod file.
+// The first line of a file that identify it as a .mod file.
 // The first three bytes are a Unicode byte order mark that ensures
 // that the module file is decoded as UTF-8 even if source files
 // are using another encoding.
-static constexpr auto magic{"\xef\xbb\xbf!mod$ v1 sum:"};
+static constexpr struct {
+  const char *bom{"\xef\xbb\xbf"};
+  const int bomLen{3};
+  const char *magic{"!mod$ v1 sum:"};
+  const int magicLen{13};
+  const int sumLen{16};
+  const char terminator{'\n'};
+  const int len{magicLen + 1 + sumLen};
+} modHeader;
 
 static std::optional<SourceName> GetSubmoduleParent(const parser::Program &);
-static std::string ModFilePath(const std::string &dir, const SourceName &,
-    const std::string &ancestor, const std::string &suffix);
 static std::vector<const Symbol *> CollectSymbols(const Scope &);
 static void PutEntity(std::ostream &, const Symbol &);
 static void PutObjectEntity(std::ostream &, const Symbol &);
@@ -55,11 +68,10 @@ static std::ostream &PutAttrs(std::ostream &, Attrs,
 static std::ostream &PutAttr(std::ostream &, Attr);
 static std::ostream &PutType(std::ostream &, const DeclTypeSpec &);
 static std::ostream &PutLower(std::ostream &, const std::string &);
-static bool WriteFile(const std::string &, std::string &&);
+static const char *WriteFile(const std::string &, const std::string &);
 static bool FileContentsMatch(
-    std::fstream &, const std::string &, const std::string &);
-static std::string GetHeader(const std::string &);
-static std::size_t GetFileSize(const std::string &);
+    std::FILE *, const std::string &, const std::string &);
+static std::string CheckSum(const std::string_view &);
 
 // Collect symbols needed for a subprogram interface
 class SubprogramSymbolCollector {
@@ -123,16 +135,22 @@ void ModFileWriter::WriteOne(const Scope &scope) {
   }
 }
 
+// Construct the name of a module file. Non-empty ancestorName means submodule.
+static std::string ModFileName(const SourceName &name,
+    const std::string &ancestorName, const std::string &suffix) {
+  std::string result{name.ToString() + suffix};
+  return ancestorName.empty() ? result : ancestorName + '-' + result;
+}
+
 // Write the module file for symbol, which must be a module or submodule.
 void ModFileWriter::Write(const Symbol &symbol) {
   auto *ancestor{symbol.get<ModuleDetails>().ancestor()};
   auto ancestorName{ancestor ? ancestor->GetName().value().ToString() : ""s};
-  auto path{ModFilePath(context_.moduleDirectory(), symbol.name(), ancestorName,
-      context_.moduleFileSuffix())};
+  auto path{context_.moduleDirectory() + '/' +
+      ModFileName(symbol.name(), ancestorName, context_.moduleFileSuffix())};
   PutSymbols(*symbol.scope());
-  if (!WriteFile(path, GetAsString(symbol))) {
-    context_.Say(symbol.name(), "Error writing %s: %s"_err_en_US, path,
-        std::strerror(errno));
+  if (const char *error{WriteFile(path, GetAsString(symbol))}) {
+    context_.Say(symbol.name(), "Error writing %s: %s"_err_en_US, path, error);
   }
 }
 
@@ -591,52 +609,60 @@ std::ostream &PutLower(std::ostream &os, const std::string &str) {
 }
 
 // Write the module file at path, prepending header. Return false on error.
-static bool WriteFile(const std::string &path, std::string &&contents) {
-  std::fstream stream;
-  auto header{GetHeader(contents)};
-  auto size{GetFileSize(path)};
-  if (size == header.size() + 1 + contents.size()) {
-    // file exists and has the right size, check the contents
-    stream.open(path, std::ios::in | std::ios::out);
-    if (FileContentsMatch(stream, header, contents)) {
-      return true;
-    }
-    stream.seekp(0);
-  } else {
-    stream.open(path, std::ios::out);
+static const char *WriteFile(
+    const std::string &path, const std::string &contents) {
+  std::FILE *fp{std::fopen(path.c_str(), "a+")};
+  if (!fp) {
+    return std::strerror(errno);
   }
-  stream << header << '\n' << contents;
-  stream.close();
-  return !stream.fail();
+  if (flock(fileno(fp), LOCK_EX | LOCK_NB) != 0) {
+    fclose(fp);
+    return "Another compilation is currently using it";
+  }
+  std::size_t size = std::ftell(fp);
+  auto header{std::string{modHeader.bom} + modHeader.magic +
+      CheckSum(contents) + modHeader.terminator};
+  if (size == header.size() + contents.size()) {
+    if (FileContentsMatch(fp, header, contents)) {
+      fclose(fp);
+      return nullptr;
+    }
+  }
+  std::rewind(fp);
+  ftruncate(fileno(fp), 0);
+  if (fwrite(header.c_str(), 1, header.size(), fp) == header.size() &&
+      fwrite(contents.c_str(), 1, contents.size(), fp) == contents.size() &&
+      fclose(fp) == 0) {
+    return nullptr;
+  } else {
+    const char *error{std::strerror(errno)};
+    fclose(fp);
+    return error;
+  }
 }
 
 // Return true if the stream matches what we would write for the mod file.
-static bool FileContentsMatch(std::fstream &stream, const std::string &header,
-    const std::string &contents) {
-  char c;
+static bool FileContentsMatch(
+    std::FILE *fp, const std::string &header, const std::string &contents) {
+  std::rewind(fp);
   for (std::size_t i{0}; i < header.size(); ++i) {
-    if (!stream.get(c) || c != header[i]) {
+    int c{std::fgetc(fp)};
+    if (c != EOF && static_cast<char>(c) != header[i]) {
       return false;
     }
-  }
-  if (!stream.get(c) || c != '\n') {
-    return false;
   }
   for (std::size_t i{0}; i < contents.size(); ++i) {
-    if (!stream.get(c) || c != contents[i]) {
+    int c{std::fgetc(fp)};
+    if (c != EOF && static_cast<char>(c) != contents[i]) {
       return false;
     }
   }
-  return !stream.get(c);
+  return std::fgetc(fp) == EOF;
 }
 
-// Compute a simple hash of the contents of a module file and
-// return it as a string of hex digits.
-// This uses the Fowler-Noll-Vo hash function.
-template<typename Iter> static std::string CheckSum(Iter begin, Iter end) {
+static std::string CheckSum(const std::string_view &contents) {
   std::uint64_t hash{0xcbf29ce484222325ull};
-  for (auto it{begin}; it != end; ++it) {
-    char c{*it};
+  for (char c : contents) {
     hash ^= c & 0xff;
     hash *= 0x100000001b3;
   }
@@ -648,33 +674,14 @@ template<typename Iter> static std::string CheckSum(Iter begin, Iter end) {
   return result;
 }
 
-static bool VerifyHeader(const std::string &path) {
-  std::fstream stream{path};
-  std::string header;
-  std::getline(stream, header);
-  auto magicLen{strlen(magic)};
-  if (header.compare(0, magicLen, magic) != 0) {
+static bool VerifyHeader(const char *content, std::size_t len) {
+  std::string_view sv{content, len};
+  if (sv.substr(0, modHeader.magicLen) != modHeader.magic) {
     return false;
   }
-  std::string expectSum{header.substr(magicLen, 16)};
-  std::string actualSum{CheckSum(std::istreambuf_iterator<char>(stream),
-      std::istreambuf_iterator<char>())};
+  std::string_view expectSum{sv.substr(modHeader.magicLen, modHeader.sumLen)};
+  std::string actualSum{CheckSum(sv.substr(modHeader.len))};
   return expectSum == actualSum;
-}
-
-static std::string GetHeader(const std::string &all) {
-  std::stringstream ss;
-  ss << magic << CheckSum(all.begin(), all.end());
-  return ss.str();
-}
-
-static std::size_t GetFileSize(const std::string &path) {
-  struct stat statbuf;
-  if (stat(path.c_str(), &statbuf) == 0) {
-    return static_cast<std::size_t>(statbuf.st_size);
-  } else {
-    return 0;
-  }
 }
 
 Scope *ModFileReader::Read(const SourceName &name, Scope *ancestor) {
@@ -690,28 +697,33 @@ Scope *ModFileReader::Read(const SourceName &name, Scope *ancestor) {
       return it->second->scope();
     }
   }
-  auto path{FindModFile(name, ancestorName)};
-  if (!path.has_value()) {
-    return nullptr;
-  }
-  // TODO: We are reading the file once to verify the checksum and then again
-  // to parse. Do it only reading the file once.
-  if (!VerifyHeader(*path)) {
-    context_.Say(name,
-        "Module file for '%s' has invalid checksum: %s"_err_en_US, name, *path);
-    return nullptr;
-  }
   parser::Parsing parsing{context_.allSources()};
   parser::Options options;
   options.isModuleFile = true;
   options.features.Enable(parser::LanguageFeature::BackslashEscapes);
-  parsing.Prescan(*path, options);
+  options.searchDirectories = context_.searchDirectories();
+  auto path{ModFileName(name, ancestorName, context_.moduleFileSuffix())};
+  parsing.Prescan(path, options);
+  const auto *sourceFile{parsing.sourceFile()};
+  if (parsing.messages().AnyFatalError()) {
+    for (auto &msg : parsing.messages().messages()) {
+      std::string str{msg.ToString()};
+      Say(name, ancestorName, parser::MessageFixedText{str.c_str(), str.size()},
+          sourceFile->path());
+    }
+    return nullptr;
+  } else if (!VerifyHeader(sourceFile->content(), sourceFile->bytes())) {
+    Say(name, ancestorName, "File has invalid checksum: %s"_en_US,
+        sourceFile->path());
+    return nullptr;
+  }
+
   parsing.Parse(nullptr);
   auto &parseTree{parsing.parseTree()};
   if (!parsing.messages().empty() || !parsing.consumedWholeFile() ||
       !parseTree.has_value()) {
-    context_.Say(
-        name, "Module file for '%s' is corrupt: %s"_err_en_US, name, *path);
+    Say(name, ancestorName, "Module file is corrupt: %s"_err_en_US,
+        sourceFile->path());
     return nullptr;
   }
   Scope *parentScope;  // the scope this module/submodule goes into
@@ -722,7 +734,6 @@ Scope *ModFileReader::Read(const SourceName &name, Scope *ancestor) {
   } else {
     parentScope = ancestor;
   }
-  // TODO: Check that default kinds of intrinsic types match?
   ResolveNames(context_, *parseTree);
   const auto &it{parentScope->find(name)};
   if (it == parentScope->end()) {
@@ -734,32 +745,16 @@ Scope *ModFileReader::Read(const SourceName &name, Scope *ancestor) {
   return modSymbol.scope();
 }
 
-std::optional<std::string> ModFileReader::FindModFile(
-    const SourceName &name, const std::string &ancestor) {
-  parser::Messages attachments;
-  for (auto &dir : context_.searchDirectories()) {
-    std::string path{
-        ModFilePath(dir, name, ancestor, context_.moduleFileSuffix())};
-    std::ifstream ifstream{path};
-    if (!ifstream.good()) {
-      attachments.Say(name, "%s: %s"_en_US, path, std::strerror(errno));
-    } else {
-      std::string line;
-      std::getline(ifstream, line);
-      if (line.compare(0, strlen(magic), magic) == 0) {
-        return path;
-      }
-      attachments.Say(name, "%s: Not a valid module file"_en_US, path);
-    }
-  }
-  auto error{parser::Message{name,
-      ancestor.empty()
-          ? "Cannot find module file for '%s'"_err_en_US
-          : "Cannot find module file for submodule '%s' of module '%s'"_err_en_US,
-      name, ancestor}};
-  attachments.AttachTo(error);
-  context_.Say(std::move(error));
-  return std::nullopt;
+parser::Message &ModFileReader::Say(const SourceName &name,
+    const std::string &ancestor, parser::MessageFixedText &&msg,
+    const std::string &arg) {
+  return context_
+      .Say(name,
+          ancestor.empty()
+              ? "Error reading module file for module '%s'"_err_en_US
+              : "Error reading module file for submodule '%s' of module '%s'"_err_en_US,
+          name, ancestor)
+      .Attach(name, std::move(msg), arg);
 }
 
 // program was read from a .mod file for a submodule; return the name of the
@@ -777,20 +772,6 @@ static std::optional<SourceName> GetSubmoduleParent(
   } else {
     return std::nullopt;
   }
-}
-
-// Construct the path to a module file. ancestorName not empty means submodule.
-static std::string ModFilePath(const std::string &dir, const SourceName &name,
-    const std::string &ancestorName, const std::string &suffix) {
-  std::stringstream path;
-  if (dir != "."s) {
-    path << dir << '/';
-  }
-  if (!ancestorName.empty()) {
-    path << ancestorName << '-';
-  }
-  path << name << suffix;
-  return path.str();
 }
 
 void SubprogramSymbolCollector::Collect() {

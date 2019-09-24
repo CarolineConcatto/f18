@@ -42,7 +42,8 @@ struct SourcePosition {
 
 class SourceFile {
 public:
-  explicit SourceFile(Encoding e) : encoding_{e} {}
+  explicit SourceFile(Encoding e, bool isModuleFile = false)
+    : encoding_{e}, isModuleFile_{isModuleFile} {}
   ~SourceFile();
   std::string path() const { return path_; }
   const char *content() const { return content_; }
@@ -73,6 +74,7 @@ private:
   std::vector<std::size_t> lineStart_;
   std::string normalized_;
   Encoding encoding_{Encoding::UTF_8};
+  bool isModuleFile_;
 };
 }
 #endif  // FORTRAN_PARSER_SOURCE_H_
