@@ -608,7 +608,8 @@ std::ostream &PutLower(std::ostream &os, const std::string &str) {
   return os;
 }
 
-// Write the module file at path, prepending header. Return false on error.
+// Write the module file at path, prepending header. If an error occurs,
+// return an error message, otherwise nullptr.
 static const char *WriteFile(
     const std::string &path, const std::string &contents) {
   std::FILE *fp{std::fopen(path.c_str(), "a+")};
@@ -660,6 +661,9 @@ static bool FileContentsMatch(
   return std::fgetc(fp) == EOF;
 }
 
+// Compute a simple hash of the contents of a module file and
+// return it as a string of hex digits.
+// This uses the Fowler-Noll-Vo hash function.
 static std::string CheckSum(const std::string_view &contents) {
   std::uint64_t hash{0xcbf29ce484222325ull};
   for (char c : contents) {
